@@ -1,0 +1,8 @@
+# Agent workflow artifacts
+agents/*.md
+codex-output.md
+verifier-context.md
+*-status.json
+*-report.json
+*-summary.json
+.artifacts/

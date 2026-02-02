@@ -1,0 +1,142 @@
+# Agent Registry - Central configuration for all AI agents
+#
+# This file defines all supported AI agents and their configurations.
+# To add a new agent:
+#   1. Add an entry here with all required fields
+#   2. Create a setup action at .github/actions/setup-{agent}/action.yml
+#   3. Add the agent's secrets to consumer repos
+#
+# The unified workflow (reusable-agent-run.yml) reads this registry
+# to determine how to execute each agent type.
+
+version: "1.0"
+
+# Default agent when no agent:* label is present
+default_agent: codex
+
+# Agent definitions
+agents:
+  codex:
+    # Display name for logs and comments
+    name: "Codex"
+    description: "OpenAI Codex agent via chatgpt-codex-connector"
+
+    # Label that triggers this agent
+    label: "agent:codex"
+
+    # CLI command to execute
+    cli: "codex"
+    cli_install: "npm install -g @openai/codex"
+
+    # Setup action path (relative to .github/actions/)
+    setup_action: "setup-codex"
+
+    # Required secrets (for documentation/validation)
+    secrets:
+      required:
+        - OPENAI_API_KEY
+      optional: []
+
+    # Environment variables to set
+    env:
+      OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}"
+
+    # Execution mode: 'github-app' or 'cli'
+    # github-app: Triggered via assignment (chatgpt-codex-connector)
+    # cli: Runs directly in GitHub Actions runner
+    execution_mode: "github-app"
+
+    # GitHub App bot username (for github-app mode)
+    bot_username: "chatgpt-codex-connector[bot]"
+
+    # Timeout in minutes
+    timeout_minutes: 30
+
+    # Capabilities this agent supports
+    capabilities:
+      - code_generation
+      - code_review
+      - bug_fixing
+      - refactoring
+      - documentation
+
+  claude:
+    name: "Claude"
+    description: "Anthropic Claude agent via Amazon Bedrock"
+
+    label: "agent:claude"
+
+    cli: "claude"
+    cli_install: "npm install -g @anthropic-ai/claude-code"
+
+    setup_action: "setup-claude"
+
+    secrets:
+      required:
+        - AWS_ACCESS_KEY_ID
+        - AWS_SECRET_ACCESS_KEY
+        - AWS_REGION
+      optional:
+        - ANTHROPIC_MODEL
+
+    env:
+      AWS_ACCESS_KEY_ID: "${{ secrets.AWS_ACCESS_KEY_ID }}"
+      AWS_SECRET_ACCESS_KEY: "${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+      AWS_REGION: "${{ secrets.AWS_REGION }}"
+      ANTHROPIC_MODEL: "${{ secrets.ANTHROPIC_MODEL || 'claude-sonnet-4-20250514' }}"
+
+    execution_mode: "cli"
+
+    timeout_minutes: 45
+
+    capabilities:
+      - code_generation
+      - code_review
+      - bug_fixing
+      - refactoring
+      - documentation
+      - complex_reasoning
+
+
+
+# Prompt configurations
+prompts:
+  # Base directory for prompts
+  base_path: ".github/codex/prompts"
+
+  # Prompt file mappings by context
+  contexts:
+    keepalive: "keepalive_next_task.md"
+    ci_fix: "fix_ci_failures.md"
+    bot_comments: "fix_bot_comments.md"
+    merge_conflicts: "fix_merge_conflicts.md"
+    verification: "verifier_acceptance_check.md"
+
+# Error patterns for classification (used by error_classifier.js)
+error_patterns:
+  codex:
+    rate_limit: "rate limit exceeded|too many requests"
+    auth_failure: "invalid api key|authentication failed"
+    timeout: "timeout|timed out"
+
+  claude:
+    rate_limit: "ThrottlingException|rate limit|too many requests"
+    auth_failure: "AccessDeniedException|invalid credentials|UnauthorizedAccess"
+    timeout: "timeout|timed out|ReadTimeoutError"
+    model_error: "ModelNotReadyException|ValidationException"
+
+  gemini:
+    rate_limit: "RESOURCE_EXHAUSTED|quota exceeded"
+    auth_failure: "UNAUTHENTICATED|invalid api key"
+    timeout: "DEADLINE_EXCEEDED|timeout"
+
+# Concurrency settings
+concurrency:
+  # Max concurrent agent runs per repo
+  max_per_repo: 3
+
+  # Max concurrent agent runs per PR
+  max_per_pr: 1
+
+  # Cooldown between runs (seconds)
+  cooldown_seconds: 60

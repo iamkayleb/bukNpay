@@ -1,0 +1,420 @@
+# Automates selection of ready agent issues and primes an agent/issue-<n> branch
+# before handing control to the belt worker. Supports all agents defined in registry.yml.
+name: Agents 71 Belt Dispatcher
+
+on:
+  workflow_call:
+    inputs:
+      agent_type:
+        description: 'Agent to dispatch (codex, claude, gemini). If empty, uses first available from queue.'
+        required: false
+        default: ''
+        type: string
+      force_issue:
+        description: 'Optional issue number to dispatch immediately'
+        required: false
+        default: ''
+        type: string
+      dry_run:
+        description: 'Preview dispatcher actions without writes'
+        required: false
+        default: false
+        type: boolean
+    secrets:
+      ACTIONS_BOT_PAT:
+        required: false
+      WORKFLOWS_APP_ID:
+        required: false
+      WORKFLOWS_APP_PRIVATE_KEY:
+        required: false
+    outputs:
+      issue:
+        description: 'Issue selected for dispatch'
+        value: ${{ jobs.dispatch.outputs.issue }}
+      branch:
+        description: 'Agent branch tied to the selected issue'
+        value: ${{ jobs.dispatch.outputs.branch }}
+      base:
+        description: 'Base branch used for the automation PR'
+        value: ${{ jobs.dispatch.outputs.base }}
+      reason:
+        description: 'Reason the dispatcher selected the issue'
+        value: ${{ jobs.dispatch.outputs.reason }}
+      agent_type:
+        description: 'Agent type detected or selected'
+        value: ${{ jobs.dispatch.outputs.agent_type }}
+      agent_name:
+        description: 'Agent display name'
+        value: ${{ jobs.dispatch.outputs.agent_name }}
+      agent_label:
+        description: 'Agent label used for search'
+        value: ${{ jobs.dispatch.outputs.agent_label }}
+      dry_run:
+        description: 'Dispatcher dry-run mode flag'
+        value: ${{ jobs.dispatch.outputs.dry_run }}
+  workflow_dispatch:
+    inputs:
+      agent_type:
+        description: 'Agent to dispatch (codex, claude, gemini). If empty, uses first available from queue.'
+        required: false
+        default: ''
+        type: string
+      force_issue:
+        description: 'Optional issue number to dispatch immediately'
+        required: false
+        default: ''
+        type: string
+      dry_run:
+        description: 'Preview dispatcher actions without writes'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  issues: write
+  actions: write
+
+concurrency:
+  group: agent-belt-dispatcher
+  cancel-in-progress: false
+
+jobs:
+  dispatch:
+    name: Select next agent issue
+    runs-on: ubuntu-latest
+    outputs:
+      issue: ${{ steps.pick.outputs.issue || '' }}
+      branch: ${{ steps.pick.outputs.branch || '' }}
+      base: ${{ steps.pick.outputs.base || '' }}
+      reason: ${{ steps.pick.outputs.reason || '' }}
+      agent_type: ${{ steps.pick.outputs.agent_type || 'codex' }}
+      agent_name: ${{ steps.pick.outputs.agent_name || 'Codex' }}
+      agent_label: ${{ steps.pick.outputs.agent_label || 'agent:codex' }}
+      dry_run: ${{ steps.mode.outputs.dry_run || 'false' }}
+    env:
+      ACTIONS_BOT_PAT: ${{ secrets.ACTIONS_BOT_PAT || '' }}
+      WORKFLOWS_APP_ID: ${{ secrets.WORKFLOWS_APP_ID || '' }}
+      WORKFLOWS_APP_PRIVATE_KEY: ${{ secrets.WORKFLOWS_APP_PRIVATE_KEY || '' }}
+    steps:
+      - name: Mint GitHub App token (preferred)
+        id: app_token
+        if: ${{ env.WORKFLOWS_APP_ID != '' && env.WORKFLOWS_APP_PRIVATE_KEY != '' }}
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ env.WORKFLOWS_APP_ID }}
+          private-key: ${{ env.WORKFLOWS_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Select authentication token (app > PAT > GITHUB_TOKEN)
+        id: select_token
+        env:
+          APP_TOKEN: ${{ steps.app_token.outputs.token || '' }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          token_value=""
+          token_source=""
+
+          if [ -n "${APP_TOKEN:-}" ]; then
+            token_value="${APP_TOKEN}"
+            token_source="WORKFLOWS_APP"
+          elif [ -n "${ACTIONS_BOT_PAT:-}" ]; then
+            token_value="${ACTIONS_BOT_PAT}"
+            token_source="ACTIONS_BOT_PAT"
+          elif [ -n "${GITHUB_TOKEN:-}" ]; then
+            token_value="${GITHUB_TOKEN}"
+            token_source="GITHUB_TOKEN"
+          fi
+
+          if [ -z "${token_value}" ]; then
+            echo '::error::No authentication token available (App token, ACTIONS_BOT_PAT, or GITHUB_TOKEN).' >&2
+            exit 1
+          fi
+
+          {
+            echo "GH_DISPATCH_TOKEN=${token_value}"
+            echo "GH_TOKEN=${token_value}"
+            echo "TOKEN_SOURCE=${token_source}"
+          } >>"$GITHUB_ENV"
+          printf 'token=%s\n' "${token_source}" >>"$GITHUB_OUTPUT"
+
+      - name: Record token source
+        env:
+          TOKEN_SOURCE: ${{ steps.select_token.outputs.token || 'unknown' }}
+          TOKEN_LOGIN: ${{ steps.app_token.outputs.app-slug || 'app-token' }}
+        run: |
+          cat <<'EOF' >>"$GITHUB_STEP_SUMMARY"
+          Authentication
+          ---------------
+          EOF
+          case "${TOKEN_SOURCE:-unknown}" in
+            'WORKFLOWS_APP')
+              cat <<'EOF' >>"$GITHUB_STEP_SUMMARY"
+          Using GitHub App token (WORKFLOWS_APP); write operations will use the app installation token instead of a PAT.
+          EOF
+              ;;
+            'ACTIONS_BOT_PAT')
+              cat <<'EOF' >>"$GITHUB_STEP_SUMMARY"
+          Using ACTIONS_BOT_PAT fallback. Configure WORKFLOWS_APP_ID and WORKFLOWS_APP_PRIVATE_KEY to enable the GitHub App path.
+          EOF
+              ;;
+            'GITHUB_TOKEN')
+              cat <<'EOF' >>"$GITHUB_STEP_SUMMARY"
+          Falling back to the default GITHUB_TOKEN. Writes may not trigger downstream workflows.
+          EOF
+              ;;
+            *)
+              echo "Unknown token source ${TOKEN_SOURCE:-unknown}" >>"$GITHUB_STEP_SUMMARY"
+              ;;
+          esac
+
+      - name: Determine dispatcher mode
+        id: mode
+        run: |
+          echo "dry_run=${{ inputs.dry_run }}" >>"$GITHUB_OUTPUT"
+
+      - name: Checkout repo (for retry helpers)
+        uses: actions/checkout@v6
+        with:
+          token: ${{ env.GH_DISPATCH_TOKEN }}
+          fetch-depth: 1
+
+      - name: Resolve Workflows default branch
+        id: workflows_ref
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const { createTokenAwareRetry } = require('./.github/scripts/github-api-with-retry.js');
+            const { withRetry } = await createTokenAwareRetry({ github, core });
+            const { data } = await withRetry((client) =>
+              client.rest.repos.get({
+                owner: 'stranske',
+                repo: 'Workflows'
+              })
+            );
+            if (!data?.default_branch) {
+              core.setFailed('Could not determine Workflows default branch');
+              return;
+            }
+            core.setOutput('ref', data.default_branch);
+
+      - name: Checkout (for retry helpers and registry)
+        uses: actions/checkout@v6
+        with:
+          repository: iamkayleb/Workflows
+          ref: ${{ steps.workflows_ref.outputs.ref }}
+          sparse-checkout: |
+            .github/scripts/github-api-with-retry.js
+            .github/agents/registry.yml
+          sparse-checkout-cone-mode: false
+
+      - name: Setup Node.js for registry parsing
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install js-yaml
+        run: npm install js-yaml
+
+      - name: Resolve candidate issue
+        id: pick
+        uses: actions/github-script@v8
+        env:
+          AGENT_TYPE_INPUT: ${{ inputs.agent_type }}
+        with:
+          github-token: ${{ env.GH_DISPATCH_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const yaml = require('js-yaml');
+            const { withRetry } = require('./.github/scripts/github-api-with-retry.js');
+            const forced = '${{ inputs.force_issue }}';
+            const agentTypeInput = (process.env.AGENT_TYPE_INPUT || '').trim().toLowerCase();
+            const { owner, repo } = context.repo;
+
+            // Load agent registry
+            let registry = { agents: {}, default_agent: 'codex' };
+            try {
+              const registryContent = fs.readFileSync('.github/agents/registry.yml', 'utf8');
+              registry = yaml.load(registryContent);
+            } catch (regError) {
+              core.warning(`Could not load agent registry: ${regError.message}`);
+              registry = {
+                default_agent: 'codex',
+                agents: {
+                  codex: { label: 'agent:codex', name: 'Codex' },
+                  claude: { label: 'agent:claude', name: 'Claude' },
+                  gemini: { label: 'agent:gemini', name: 'Gemini' }
+                }
+              };
+            }
+
+            // Determine agent to use
+            let agentId = agentTypeInput || registry.default_agent || 'codex';
+            let agentConfig = registry.agents[agentId];
+            if (!agentConfig) {
+              core.warning(`Agent '${agentId}' not found in registry, using default`);
+              agentId = registry.default_agent || 'codex';
+              agentConfig = registry.agents[agentId];
+            }
+
+            const agentLabel = agentConfig?.label || `agent:${agentId}`;
+            const agentName = agentConfig?.name || agentId;
+
+            const summary = core.summary;
+            summary.addHeading(`${agentName} Belt Dispatcher`);
+
+            let issueNumber = null;
+            let reason = '';
+
+            // If forced issue, detect agent from its labels
+            if (forced && String(forced).trim()) {
+              issueNumber = Number(String(forced).trim());
+              reason = 'manual-dispatch';
+
+              // Fetch issue to verify agent label matches
+              try {
+                const { data: issue } = await withRetry(() => github.rest.issues.get({
+                  owner,
+                  repo,
+                  issue_number: issueNumber
+                }));
+                const labels = issue.labels.map(l => l.name.toLowerCase());
+                if (!labels.includes(agentLabel.toLowerCase())) {
+                  core.warning(`Forced issue #${issueNumber} doesn't have ${agentLabel} label, but proceeding anyway`);
+                }
+              } catch (error) {
+                core.warning(`Could not verify forced issue #${issueNumber}: ${error.message}`);
+              }
+            }
+
+            // Search for issues with the agent label
+            if (!issueNumber) {
+              const { data: issues } = await withRetry(() => github.rest.issues.listForRepo({
+                owner,
+                repo,
+                state: 'open',
+                labels: `${agentLabel},status:ready`,
+                sort: 'created',
+                direction: 'asc',
+                per_page: 30,
+              }));
+              const match = issues.find((issue) => !issue.pull_request);
+              if (match) {
+                issueNumber = match.number;
+                reason = 'queue-selection';
+              }
+            }
+
+            if (!issueNumber) {
+              summary.addRaw(`No open issues with labels \`${agentLabel}\` and \`status:ready\` were found.`).write();
+              core.setOutput('issue', '');
+              core.setOutput('reason', 'empty');
+              core.setOutput('agent_type', agentId);
+              core.setOutput('agent_name', agentName);
+              core.setOutput('agent_label', agentLabel);
+              return;
+            }
+
+            summary.addTable([
+              [
+                { data: 'Issue', header: true },
+                { data: 'Agent', header: true },
+                { data: 'Reason', header: true }
+              ],
+              [
+                `#${issueNumber}`,
+                agentName,
+                reason || '(unspecified)'
+              ]
+            ]);
+
+            const { data: repoInfo } = await withRetry(() => github.rest.repos.get({ owner, repo }));
+            const base = repoInfo.default_branch;
+            if (!base) {
+              core.setFailed('Repository default branch not available');
+              return;
+            }
+            const branch = `${agentId}/issue-${issueNumber}`;
+
+            core.setOutput('issue', String(issueNumber));
+            core.setOutput('branch', branch);
+            core.setOutput('base', base);
+            core.setOutput('reason', reason || '');
+            core.setOutput('agent_type', agentId);
+            core.setOutput('agent_name', agentName);
+            core.setOutput('agent_label', agentLabel);
+            summary.addRaw(`Selected issue #${issueNumber} → branch \`${branch}\` on base \`${base}\`.`).write();
+
+      - name: Stop when queue is empty
+        if: ${{ steps.pick.outputs.issue == '' }}
+        run: echo 'No work queued.'
+
+      - name: Checkout default branch
+        if: ${{ steps.pick.outputs.issue != '' && steps.mode.outputs.dry_run != 'true' }}
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ steps.pick.outputs.base }}
+          token: ${{ env.GH_DISPATCH_TOKEN }}
+          fetch-depth: 0
+
+      - name: Create codex branch if missing
+        if: ${{ steps.pick.outputs.issue != '' && steps.mode.outputs.dry_run != 'true' }}
+        run: |
+          set -euo pipefail
+          branch="${{ steps.pick.outputs.branch }}"
+          default_ref="${{ steps.pick.outputs.base }}"
+
+          git config user.name "stranske-automation-bot"
+          git config user.email "stranske-automation-bot@users.noreply.github.com"
+
+          existing_ref=$(git ls-remote --heads origin "$branch" || true)
+          if [ -n "$existing_ref" ]; then
+            echo "Branch $branch already exists on origin; leaving as-is."
+          else
+            git checkout -b "$branch"
+            git push origin "$branch"
+            echo "Created branch $branch from $default_ref."
+          fi
+
+      - name: Transition issue to in-progress
+        if: ${{ steps.pick.outputs.issue != '' && steps.mode.outputs.dry_run != 'true' }}
+        uses: actions/github-script@v8
+        with:
+          github-token: ${{ env.GH_DISPATCH_TOKEN }}
+          script: |
+            const { withRetry } = require('./.github/scripts/github-api-with-retry.js');
+            const issue = Number('${{ steps.pick.outputs.issue }}');
+            if (!issue) { return; }
+            const { owner, repo } = context.repo;
+            const branch = '${{ steps.pick.outputs.branch }}';
+            try {
+              await withRetry(() => github.rest.issues.removeLabel({ owner, repo, issue_number: issue, name: 'status:ready' }));
+            } catch (error) {
+              if (error.status !== 404) {
+                core.warning(`Failed to remove status:ready: ${error.message}`);
+              }
+            }
+            try {
+              await withRetry(() => github.rest.issues.addLabels({ owner, repo, issue_number: issue, labels: ['status:in-progress'] }));
+            } catch (error) {
+              core.warning(`Failed to add status:in-progress: ${error.message}`);
+            }
+            const agentName = '${{ steps.pick.outputs.agent_name }}';
+            try {
+              await withRetry(() => github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: issue,
+                body: `${agentName} belt dispatcher queued this issue and created branch \`${branch}\`.`
+              }));
+            } catch (error) {
+              core.warning(`Failed to comment on issue #${issue}: ${error.message}`);
+            }
+
+      - name: Summarise dispatcher mode
+        if: ${{ steps.pick.outputs.issue != '' && steps.mode.outputs.dry_run == 'true' }}
+        run: |
+          cat <<'EOF' >>"$GITHUB_STEP_SUMMARY"
+          Dispatcher executed in dry-run mode. No branches, labels, or comments were changed.
+          EOF
