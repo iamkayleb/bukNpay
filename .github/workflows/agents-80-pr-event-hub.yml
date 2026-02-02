@@ -191,7 +191,7 @@ jobs:
           allowed_keepalive_logins: ${{ vars.ALLOWED_KEEPALIVE_LOGINS }}
           allow_replay: ${{ needs.resolve.outputs.event_name == 'workflow_run' }}
           dry_run: ${{ needs.resolve.outputs.debug == 'true' }}
-        secrets: inherit
+          secrets: inherit
 
       - name: Bot comment handler
         if: |
