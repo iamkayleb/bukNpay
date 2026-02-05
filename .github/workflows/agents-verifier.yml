@@ -186,7 +186,7 @@ jobs:
   verifier:
     needs: check
     if: needs.check.outputs.should_run == 'true'
-    uses: iamkayleb/Workflows/.github/workflows/reusable-agents-verifier.yml@v1
+    uses: iamkayleb/Workflows/.github/workflows/reusable-agents-verifier.yml@man
     with:
       # CI workflows to wait for before running verifier
       ci_workflows: '["ci.yml", "pr-00-gate.yml"]'

@@ -283,7 +283,7 @@ jobs:
       needs.evaluate.outputs.action == 'run' ||
       needs.evaluate.outputs.action == 'fix' ||
       needs.evaluate.outputs.action == 'conflict'
-    uses: iamkayleb/Workflows/.github/workflows/reusable-agent-run.yml@v1
+    uses: iamkayleb/Workflows/.github/workflows/reusable-agent-run.yml@man
     secrets: inherit
     with:
       agent_type: ${{ needs.evaluate.outputs.agent_type }}
@@ -817,7 +817,7 @@ jobs:
     needs: prepare
     if: needs.prepare.outputs.should_run == 'true'
     name: Run Codex autofix
-    uses: iamkayleb/Workflows/.github/workflows/reusable-codex-run.yml@v1
+    uses: iamkayleb/Workflows/.github/workflows/reusable-codex-run.yml@man
     with:
       prompt_file: .github/codex/prompts/autofix_from_ci_failure.md
       mode: autofix
